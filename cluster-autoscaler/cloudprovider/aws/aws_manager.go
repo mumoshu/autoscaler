@@ -53,8 +53,9 @@ type autoScaling interface {
 
 // AwsManager is handles aws communication and data caching.
 type AwsManager struct {
-	asgs     []*asgInformation
-	asgCache map[AwsRef]*Asg
+	asgs                     []*asgInformation
+	asgCache                 map[AwsRef]*Asg
+	instancesNotInManagedAsg map[AwsRef]struct{}
 
 	service    autoScaling
 	cacheMutex sync.Mutex
@@ -72,9 +73,10 @@ func CreateAwsManager(configReader io.Reader) (*AwsManager, error) {
 
 	service := autoscaling.New(session.New())
 	manager := &AwsManager{
-		asgs:     make([]*asgInformation, 0),
-		service:  service,
-		asgCache: make(map[AwsRef]*Asg),
+		asgs:                     make([]*asgInformation, 0),
+		service:                  service,
+		asgCache:                 make(map[AwsRef]*Asg),
+		instancesNotInManagedAsg: make(map[AwsRef]struct{}),
 	}
 
 	go wait.Forever(func() {
@@ -173,6 +175,12 @@ func (m *AwsManager) GetAsgForInstance(instance *AwsRef) (*Asg, error) {
 	if config, found := m.asgCache[*instance]; found {
 		return config, nil
 	}
+	if _, found := m.instancesNotInManagedAsg[*instance]; found {
+		// The instance is already known to not belong to any configured ASG
+		// Skip regenerateCache so that we won't unnecessarily call DescribeAutoScalingGroups
+		// See https://github.com/kubernetes/contrib/issues/2541
+		return nil, nil
+	}
 	if err := m.regenerateCache(); err != nil {
 		return nil, fmt.Errorf("Error while looking for ASG for instance %+v, error: %v", *instance, err)
 	}
@@ -180,6 +188,8 @@ func (m *AwsManager) GetAsgForInstance(instance *AwsRef) (*Asg, error) {
 		return config, nil
 	}
 	// instance does not belong to any configured ASG
+	glog.V(6).Infof("Instance %+v is not in any ASG managed by CA. CA is now memorizing the fact not to unnecessarily call AWS API afterwards trying to find the unexistent managed ASG for the instance", *instance)
+	m.instancesNotInManagedAsg[*instance] = struct{}{}
 	return nil, nil
 }
 
