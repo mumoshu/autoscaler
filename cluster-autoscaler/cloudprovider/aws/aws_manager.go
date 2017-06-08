@@ -17,10 +17,8 @@ limitations under the License.
 package aws
 
 import (
-	"errors"
 	"fmt"
 	"io"
-	"sync"
 	"time"
 
 	"gopkg.in/gcfg.v1"
@@ -29,7 +27,6 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/autoscaling"
 	"github.com/golang/glog"
-	"k8s.io/apimachinery/pkg/util/wait"
 	provider_aws "k8s.io/kubernetes/pkg/cloudprovider/providers/aws"
 )
 
@@ -44,21 +41,10 @@ type asgInformation struct {
 	basename string
 }
 
-type autoScaling interface {
-	DescribeAutoScalingGroups(input *autoscaling.DescribeAutoScalingGroupsInput) (*autoscaling.DescribeAutoScalingGroupsOutput, error)
-	DescribeTags(input *autoscaling.DescribeTagsInput) (*autoscaling.DescribeTagsOutput, error)
-	SetDesiredCapacity(input *autoscaling.SetDesiredCapacityInput) (*autoscaling.SetDesiredCapacityOutput, error)
-	TerminateInstanceInAutoScalingGroup(input *autoscaling.TerminateInstanceInAutoScalingGroupInput) (*autoscaling.TerminateInstanceInAutoScalingGroupOutput, error)
-}
-
 // AwsManager is handles aws communication and data caching.
 type AwsManager struct {
-	asgs                     []*asgInformation
-	asgCache                 map[AwsRef]*Asg
-	instancesNotInManagedAsg map[AwsRef]struct{}
-
-	service    autoScaling
-	cacheMutex sync.Mutex
+	service autoScalingWrapper
+	asgs    *autoScalingGroups
 }
 
 // CreateAwsManager constructs awsManager object.
@@ -71,33 +57,29 @@ func CreateAwsManager(configReader io.Reader) (*AwsManager, error) {
 		}
 	}
 
-	service := autoscaling.New(session.New())
-	manager := &AwsManager{
-		asgs:                     make([]*asgInformation, 0),
-		service:                  service,
-		asgCache:                 make(map[AwsRef]*Asg),
-		instancesNotInManagedAsg: make(map[AwsRef]struct{}),
+	service := autoScalingWrapper{
+		autoscaling.New(session.New()),
 	}
-
-	go wait.Forever(func() {
-		manager.cacheMutex.Lock()
-		defer manager.cacheMutex.Unlock()
-		if err := manager.regenerateCache(); err != nil {
-			glog.Errorf("Error while regenerating Asg cache: %v", err)
-		}
-	}, time.Hour)
+	manager := &AwsManager{
+		asgs:    newAutoScalingGroups(service),
+		service: service,
+	}
 
 	return manager, nil
 }
 
 // RegisterAsg registers asg in Aws Manager.
 func (m *AwsManager) RegisterAsg(asg *Asg) {
-	m.cacheMutex.Lock()
-	defer m.cacheMutex.Unlock()
+	m.asgs.Register(asg)
+}
 
-	m.asgs = append(m.asgs, &asgInformation{
-		config: asg,
-	})
+// GetAsgForInstance returns AsgConfig of the given Instance
+func (m *AwsManager) GetAsgForInstance(instance *AwsRef) (*Asg, error) {
+	return m.asgs.FindForInstance(instance)
+}
+
+func (m *AwsManager) getAutoscalingGroupsByTag(key string) ([]*autoscaling.Group, error) {
+	return m.service.getAutoscalingGroupsByTag(key)
 }
 
 // GetAsgSize gets ASG size.
@@ -139,12 +121,12 @@ func (m *AwsManager) DeleteInstances(instances []*AwsRef) error {
 	if len(instances) == 0 {
 		return nil
 	}
-	commonAsg, err := m.GetAsgForInstance(instances[0])
+	commonAsg, err := m.asgs.FindForInstance(instances[0])
 	if err != nil {
 		return err
 	}
 	for _, instance := range instances {
-		asg, err := m.GetAsgForInstance(instance)
+		asg, err := m.asgs.FindForInstance(instance)
 		if err != nil {
 			return err
 		}
@@ -168,160 +150,10 @@ func (m *AwsManager) DeleteInstances(instances []*AwsRef) error {
 	return nil
 }
 
-// GetAsgForInstance returns AsgConfig of the given Instance
-func (m *AwsManager) GetAsgForInstance(instance *AwsRef) (*Asg, error) {
-	m.cacheMutex.Lock()
-	defer m.cacheMutex.Unlock()
-	if config, found := m.asgCache[*instance]; found {
-		return config, nil
-	}
-	if _, found := m.instancesNotInManagedAsg[*instance]; found {
-		// The instance is already known to not belong to any configured ASG
-		// Skip regenerateCache so that we won't unnecessarily call DescribeAutoScalingGroups
-		// See https://github.com/kubernetes/contrib/issues/2541
-		return nil, nil
-	}
-	if err := m.regenerateCache(); err != nil {
-		return nil, fmt.Errorf("Error while looking for ASG for instance %+v, error: %v", *instance, err)
-	}
-	if config, found := m.asgCache[*instance]; found {
-		return config, nil
-	}
-	// instance does not belong to any configured ASG
-	glog.V(6).Infof("Instance %+v is not in any ASG managed by CA. CA is now memorizing the fact not to unnecessarily call AWS API afterwards trying to find the unexistent managed ASG for the instance", *instance)
-	m.instancesNotInManagedAsg[*instance] = struct{}{}
-	return nil, nil
-}
-
-func (m *AwsManager) regenerateCache() error {
-	newCache := make(map[AwsRef]*Asg)
-
-	for _, asg := range m.asgs {
-		glog.V(4).Infof("Regenerating ASG information for %s", asg.config.Name)
-
-		group, err := m.getAutoscalingGroup(asg.config.Name)
-		if err != nil {
-			return err
-		}
-		for _, instance := range group.Instances {
-			ref := AwsRef{Name: *instance.InstanceId}
-			newCache[ref] = asg.config
-		}
-	}
-
-	m.asgCache = newCache
-	return nil
-}
-
-func (m *AwsManager) getAutoscalingGroup(name string) (*autoscaling.Group, error) {
-	params := &autoscaling.DescribeAutoScalingGroupsInput{
-		AutoScalingGroupNames: []*string{aws.String(name)},
-		MaxRecords:            aws.Int64(1),
-	}
-	groups, err := m.service.DescribeAutoScalingGroups(params)
-	if err != nil {
-		glog.V(4).Infof("Failed ASG info request for %s: %v", name, err)
-		return nil, err
-	}
-	if len(groups.AutoScalingGroups) < 1 {
-		return nil, fmt.Errorf("Unable to get first autoscaling.Group for %s", name)
-	}
-	return groups.AutoScalingGroups[0], nil
-}
-
-func (m *AwsManager) getAutoscalingGroupsByNames(names []string) ([]*autoscaling.Group, error) {
-	glog.V(6).Infof("Starting getAutoscalingGroupsByNames with names=%v", names)
-
-	nameRefs := []*string{}
-	for _, n := range names {
-		nameRefs = append(nameRefs, aws.String(n))
-	}
-	params := &autoscaling.DescribeAutoScalingGroupsInput{
-		AutoScalingGroupNames: nameRefs,
-		MaxRecords:            aws.Int64(maxRecordsReturnedByAPI),
-	}
-	description, err := m.service.DescribeAutoScalingGroups(params)
-	if err != nil {
-		glog.V(4).Infof("Failed to describe ASGs : %v", err)
-		return nil, err
-	}
-	if len(description.AutoScalingGroups) < 1 {
-		return nil, errors.New("No ASGs found")
-	}
-
-	asgs := description.AutoScalingGroups
-	for description.NextToken != nil {
-		description, err = m.service.DescribeAutoScalingGroups(&autoscaling.DescribeAutoScalingGroupsInput{
-			NextToken:  description.NextToken,
-			MaxRecords: aws.Int64(maxRecordsReturnedByAPI),
-		})
-		if err != nil {
-			glog.V(4).Infof("Failed to describe ASGs : %v", err)
-			return nil, err
-		}
-		asgs = append(asgs, description.AutoScalingGroups...)
-	}
-
-	glog.V(6).Infof("Finishing getAutoscalingGroupsByNames asgs=%v", asgs)
-
-	return asgs, nil
-}
-
-func (m *AwsManager) getAutoscalingGroupsByTag(key string) ([]*autoscaling.Group, error) {
-	glog.V(6).Infof("Starting getAutoscalingGroupsByTag with key=%v", key)
-
-	tags := []*autoscaling.TagDescription{}
-
-	description, err := m.service.DescribeTags(&autoscaling.DescribeTagsInput{
-		Filters: []*autoscaling.Filter{
-			{
-				Name:   aws.String("key"),
-				Values: []*string{aws.String(key)},
-			},
-		},
-		MaxRecords: aws.Int64(maxRecordsReturnedByAPI),
-	})
-	if err != nil {
-		glog.V(4).Infof("Failed to describe ASG tags for key %s : %v", key, err)
-		return nil, err
-	}
-	if len(description.Tags) < 1 {
-		return nil, fmt.Errorf("Unable to find ASGs for tag key %s", key)
-	}
-	tags = append(tags, description.Tags...)
-
-	for description.NextToken != nil {
-		description, err = m.service.DescribeTags(&autoscaling.DescribeTagsInput{
-			NextToken:  description.NextToken,
-			MaxRecords: aws.Int64(maxRecordsReturnedByAPI),
-		})
-		if err != nil {
-			glog.V(4).Infof("Failed to describe ASG tags for key %s: %v", key, err)
-			return nil, err
-		}
-		tags = append(tags, description.Tags...)
-	}
-
-	asgNames := []string{}
-	for _, t := range tags {
-		asgName := t.ResourceId
-		asgNames = append(asgNames, *asgName)
-	}
-
-	asgs, err := m.getAutoscalingGroupsByNames(asgNames)
-	if err != nil {
-		return nil, err
-	}
-
-	glog.V(6).Infof("Finishing getAutoscalingGroupsByTag with asgs=%v", asgs)
-
-	return asgs, nil
-}
-
 // GetAsgNodes returns Asg nodes.
 func (m *AwsManager) GetAsgNodes(asg *Asg) ([]string, error) {
 	result := make([]string, 0)
-	group, err := m.getAutoscalingGroup(asg.Name)
+	group, err := m.service.getAutoscalingGroupByName(asg.Name)
 	if err != nil {
 		return []string{}, err
 	}
